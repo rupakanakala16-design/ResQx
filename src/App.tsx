@@ -1,0 +1,571 @@
+import { useState, useMemo, useEffect, useRef } from 'react';
+import { useResQXTelemetry } from './telemetry/useResQXTelemetry';
+import { sirenAudio } from './utils/sirenAudio';
+import { AppHeader } from './components/AppHeader';
+import { SimulationViewport } from './components/SimulationViewport';
+import { AmbulanceStatus } from './components/AmbulanceStatus';
+import { CorridorFlowPipeline } from './components/CorridorFlowPipeline';
+import { LiveTelemetryCard } from './components/LiveTelemetryCard';
+import { SignalStatus } from './components/SignalStatus';
+import { SafetyGateCard } from './components/SafetyGateCard';
+import { EventTimeline } from './components/EventTimeline';
+import { AIRecommendationCard } from './components/AIRecommendationCard';
+import { PoliceCoordinationCard } from './components/PoliceCoordinationCard';
+import { SimulationControls } from './components/SimulationControls';
+import { SignalControlView } from './components/SignalControlView';
+import { AnalyticsView } from './components/AnalyticsView';
+import { AlertsView } from './components/AlertsView';
+import { decisionEngine } from './ai/decisionEngine';
+import { getDefaultCityGraph } from './routing/graph';
+import { calculateAmbulanceRoute } from './routing/engine';
+import { calculateAmbulanceEta } from './routing/eta';
+import { planEmergencyCorridor } from './routing/corridor';
+import { validateCorridorPlan } from './safety/validator';
+import { executeValidatedControl } from './controllers/signalController';
+import { PoliceCoordinator } from './services/policeCoordinator';
+import { getAlertService } from './services/alertService';
+import type { EmergencyEvent } from './types/events';
+import type { JunctionAssignment } from './types/police';
+
+export interface DispatchedAlertRecord {
+  signalId: string;
+  emergencyId: string;
+  officerName: string;
+  badgeNumber: string;
+  status: 'DISPATCHED' | 'DELIVERED' | 'DEMO';
+  timestamp: number;
+  title: string;
+  mode: 'DEMO' | 'LIVE';
+}
+
+interface TransitionTracker {
+  emergencyDetected: boolean;
+  lastDecisionAction: string;
+  lastDecisionSignal: string;
+  lastSafetyDecision: string;
+  signalPhases: Record<string, string>;
+  arrived: boolean;
+}
+
+function App() {
+  const { telemetry, connectionStatus, sendControl, overrideSignal } = useResQXTelemetry();
+  const [activeTab, setActiveTab] = useState('live');
+  const [dismissedRecId, setDismissedRecId] = useState<string | null>(null);
+  const [pipelineEvents, setPipelineEvents] = useState<EmergencyEvent[]>([]);
+  const [dispatchedAlerts, setDispatchedAlerts] = useState<DispatchedAlertRecord[]>([]);
+
+  // Static Route Memoization (Zero UI Lag)
+  const staticRoute = useMemo(() => {
+    return calculateAmbulanceRoute(getDefaultCityGraph());
+  }, []);
+
+  // State Transition Tracker Ref (Strictly prevents per-tick duplicate event flooding)
+  const transitionTrackerRef = useRef<TransitionTracker>({
+    emergencyDetected: false,
+    lastDecisionAction: '',
+    lastDecisionSignal: '',
+    lastSafetyDecision: '',
+    signalPhases: {},
+    arrived: false,
+  });
+
+  // Police Coordinator Ref (Maintains deduplication history across ticks)
+  const policeCoordinatorRef = useRef<PoliceCoordinator>(new PoliceCoordinator());
+
+  // 1. Canonical AI Decision Engine
+  const recommendation = useMemo(() => {
+    let rec = decisionEngine(telemetry);
+    if (dismissedRecId && rec.id.startsWith(dismissedRecId.split('-')[1])) {
+      rec = {
+        id: `rec-dismissed-${rec.timestamp}`,
+        recommendation: 'Monitoring traffic network',
+        reason: 'Override recommendation dismissed by operator. Monitoring corridor status.',
+        confidence: 100,
+        action: 'DISMISS',
+        timestamp: rec.timestamp,
+      };
+    }
+    return rec;
+  }, [telemetry, dismissedRecId]);
+
+  // 2. Predictive Corridor Planning & Canonical Safety Validation Gate
+  const { safetyValidation, corridorPlan, policeAssignments } = useMemo(() => {
+    if (!telemetry) {
+      return { safetyValidation: null, corridorPlan: null, policeAssignments: [] };
+    }
+    const amb = telemetry.ambulance;
+    const eta = calculateAmbulanceEta({
+      routeResult: staticRoute,
+      ambulance: {
+        speedKmh: amb?.speedKmh ?? 50,
+        currentRoadId: amb?.currentRoad ?? 'ROAD-01',
+        progressOnCurrentRoad: 0,
+        status: amb?.status ?? 'EN_ROUTE',
+      },
+      signals: [
+        { id: 'SIG-01', name: 'North Corridor Signal', road: 'ROAD-01', position: { x: 300, y: 150 } },
+        { id: 'SIG-02', name: 'Central Intersection Signal', road: 'ROAD-01', position: { x: 300, y: 275 } },
+        { id: 'SIG-03', name: 'Hospital Approach Signal', road: 'ROAD-03', position: { x: 300, y: 400 } },
+        { id: 'SIG-04', name: 'South Corridor Signal', road: 'ROAD-03', position: { x: 300, y: 525 } },
+      ],
+    });
+    const corridor = planEmergencyCorridor(eta);
+    const val = validateCorridorPlan(corridor);
+    const assignments = policeCoordinatorRef.current.assignOfficersForCorridor(
+      corridor,
+      amb?.id ?? 'AMB-01',
+      telemetry.simulation.elapsedTime
+    );
+
+    return { safetyValidation: val, corridorPlan: corridor, policeAssignments: assignments };
+  }, [telemetry, staticRoute]);
+
+  const isConnected = connectionStatus === 'CONNECTED';
+  const simulationTime = telemetry ? telemetry.simulation.elapsedTime : 0;
+  const isRunning = telemetry ? telemetry.simulation.running : false;
+  const simSpeed = (telemetry?.simulation.speed as 1 | 2 | 5) ?? 1;
+
+  // 3. Canonical Runtime Pipeline & Transition-Based Audit Logging
+  useEffect(() => {
+    if (!telemetry || !isRunning) return;
+
+    const tTime = telemetry.simulation.elapsedTime;
+    const amb = telemetry.ambulance;
+    const tracker = transitionTrackerRef.current;
+    const newEvents: EmergencyEvent[] = [];
+
+    // Reset alert deduplication if mission is staged
+    if (amb.status === 'STAGED') {
+      policeCoordinatorRef.current.resetHistory();
+      setDispatchedAlerts([]);
+    }
+
+    // Helper: Dispatches a real NTFY alert naturally when a signal enters priority
+    const dispatchAlertForSignal = (sigId: string) => {
+      const coordinator = policeCoordinatorRef.current;
+      if (!coordinator.shouldSendAlert(amb.id, sigId)) {
+        return;
+      }
+      coordinator.markAlertSent(amb.id, sigId);
+
+      const officer = coordinator.selectOfficerForJunction(sigId);
+      if (!officer) return;
+
+      const sigTelemetry = telemetry.signals.find((sig) => sig.id === sigId);
+      const etaSec = Math.round(
+        ((sigTelemetry?.distanceFromAmbulance ?? 100) / Math.max(amb.speedKmh / 3.6, 5)) * 10
+      ) / 10;
+
+      const assignment: JunctionAssignment = {
+        junctionId: sigId,
+        signalId: sigId,
+        officerId: officer.officerId,
+        officerName: officer.name,
+        badgeNumber: officer.badgeNumber,
+        contactIdentifier: officer.contactIdentifier,
+        assignmentReason: `Primary on-duty officer covering ${sigId}`,
+        emergencyId: amb.id,
+        etaSeconds: etaSec,
+        assignedAt: tTime,
+        status: 'ASSIGNED',
+      };
+
+      const alert = coordinator.createEmergencyAlert(assignment, 'CRITICAL', Date.now());
+      if (alert) {
+        getAlertService()
+          .sendAlert(alert)
+          .then((res) => {
+            const isDelivered = res.status === 'DELIVERED';
+            const isLive = res.mode === 'LIVE';
+            const alertStatus = isDelivered ? 'DELIVERED' : res.mode === 'DEMO' ? 'DEMO' : 'DISPATCHED';
+
+            setDispatchedAlerts((prev) => [
+              ...prev.filter((a) => a.signalId !== sigId),
+              {
+                signalId: sigId,
+                emergencyId: amb.id,
+                officerName: officer.name,
+                badgeNumber: officer.badgeNumber,
+                status: alertStatus,
+                timestamp: tTime,
+                title: `RESQX ALERT — ${amb.id} at ${sigId}`,
+                mode: res.mode,
+              },
+            ]);
+
+            setPipelineEvents((prev) => [
+              {
+                id: `evt-police-alert-${sigId}-${tTime}`,
+                timestamp: tTime,
+                type: 'POLICE_ALERT_DISPATCHED',
+                description: isDelivered
+                  ? `👮 Real NTFY Alert DELIVERED to ${officer.name} for ${sigId} (RESQX ALERT — ${amb.id} at ${sigId})`
+                  : isLive
+                  ? `👮 Live Alert DISPATCHED to ${officer.name} for ${sigId} (Pending Provider Delivery)`
+                  : `👮 Demo Alert Recorded for ${officer.name} at ${sigId} (Console Demo Mode — Set NTFY_TOPIC for phone alerts)`,
+                severity: isDelivered ? 'SUCCESS' : 'INFO',
+                relatedSignal: sigId,
+                relatedUnit: amb.id,
+              },
+              ...prev,
+            ]);
+          })
+          .catch((err) => {
+            console.warn(`[ResQX Alert] Outbound dispatch error for ${sigId}:`, err);
+            setPipelineEvents((prev) => [
+              {
+                id: `evt-police-alert-err-${sigId}-${tTime}`,
+                timestamp: tTime,
+                type: 'POLICE_ALERT_FAILED',
+                description: `⚠️ Alert delivery FAILED for ${sigId}: ${err instanceof Error ? err.message : 'Offline'}`,
+                severity: 'WARNING',
+                relatedSignal: sigId,
+                relatedUnit: amb.id,
+              },
+              ...prev,
+            ]);
+          });
+      }
+    };
+
+    // Phase 1 Transition: Emergency Mission Started
+    if (amb.status === 'EN_ROUTE' && !tracker.emergencyDetected) {
+      tracker.emergencyDetected = true;
+      newEvents.push({
+        id: `evt-emergency-start-${tTime}`,
+        timestamp: tTime,
+        type: 'EMERGENCY_DETECTED',
+        description: `🚨 Emergency dispatch activated: AMB-01 en route to ${telemetry.mission.destination}`,
+        severity: 'CRITICAL',
+        relatedUnit: 'AMB-01',
+      });
+    }
+
+    // Phase 2 Transition: Decision Engine State Change
+    const currentAction = recommendation.action ?? '';
+    const currentTargetSignal = recommendation.targetSignal ?? '';
+    if (
+      currentAction !== tracker.lastDecisionAction ||
+      currentTargetSignal !== tracker.lastDecisionSignal
+    ) {
+      tracker.lastDecisionAction = currentAction;
+      tracker.lastDecisionSignal = currentTargetSignal;
+
+      if (recommendation.action === 'EXECUTE_OVERRIDE' && recommendation.targetSignal) {
+        const sigId = recommendation.targetSignal;
+        newEvents.push({
+          id: `evt-decision-${sigId}-${tTime}`,
+          timestamp: tTime,
+          type: 'AI_RECOMMENDATION',
+          description: `🧠 AI Decision: ${recommendation.recommendation} (${recommendation.confidence}% confidence)`,
+          severity: 'WARNING',
+          relatedSignal: sigId,
+          relatedUnit: 'AMB-01',
+        });
+
+        // Trigger priority for approaching signal across local simulation and SUMO bridge
+        overrideSignal(sigId, 'EMERGENCY_PRIORITY', 'GGGrr');
+        fetch(`http://localhost:8000/api/signal?signalId=${sigId}&state=PRIORITY&pattern=GGGrr`, {
+          method: 'GET',
+          cache: 'no-store',
+        }).catch(() => {
+          // offline handling
+        });
+      }
+    }
+
+    // Phase 3 Transition: Safety Validator Gate & Signal Controller Execution
+    if (safetyValidation) {
+      if (safetyValidation.decision !== tracker.lastSafetyDecision) {
+        tracker.lastSafetyDecision = safetyValidation.decision;
+
+        if (safetyValidation.decision === 'APPROVED') {
+          newEvents.push({
+            id: `evt-safety-appr-${tTime}`,
+            timestamp: tTime,
+            type: 'SAFETY_APPROVED',
+            description: `🛡️ Safety Gate APPROVED: All 5 corridor constraints verified (${safetyValidation.approvedCommands.length} signals)`,
+            severity: 'SUCCESS',
+            relatedUnit: 'AMB-01',
+          });
+
+          // Dispatch approved signal commands
+          executeValidatedControl(safetyValidation, {
+            onLocalSignalChange: (sigId, phase, pat) => overrideSignal(sigId, phase, pat),
+          });
+        } else if (safetyValidation.decision === 'BLOCKED') {
+          newEvents.push({
+            id: `evt-safety-block-${tTime}`,
+            timestamp: tTime,
+            type: 'SAFETY_BLOCKED',
+            description: `🛡️ Safety Gate BLOCKED: ${safetyValidation.safetySummary}`,
+            severity: 'CRITICAL',
+            relatedUnit: 'AMB-01',
+          });
+        }
+      }
+    }
+
+    // Phase 4 Transition: Signal Phase Progression Audit
+    for (const s of telemetry.signals) {
+      const prevPhase = tracker.signalPhases[s.id] ?? 'NORMAL';
+      if (s.emergencyState !== prevPhase) {
+        tracker.signalPhases[s.id] = s.emergencyState;
+
+        if (s.emergencyState === 'PREPARING') {
+          newEvents.push({
+            id: `evt-sig-prep-${s.id}-${tTime}`,
+            timestamp: tTime,
+            type: 'SIGNAL_PREPARING',
+            description: `🟡 ${s.id}: Preparing clearance & pedestrian lockout`,
+            severity: 'WARNING',
+            relatedSignal: s.id,
+          });
+        } else if (s.emergencyState === 'EMERGENCY PRIORITY' || (s.emergencyState as string) === 'PRIORITY') {
+          newEvents.push({
+            id: `evt-sig-prio-${s.id}-${tTime}`,
+            timestamp: tTime,
+            type: 'SIGNAL_PRIORITY_EXECUTED',
+            description: `🟢 ${s.id}: Emergency Green Wave PRIORITY active`,
+            severity: 'SUCCESS',
+            relatedSignal: s.id,
+          });
+          // Natural live notification triggered by the signal priority event!
+          dispatchAlertForSignal(s.id);
+        } else if (s.emergencyState === 'RESTORED' || (s.emergencyState as string) === 'RESTORING') {
+          newEvents.push({
+            id: `evt-sig-rest-${s.id}-${tTime}`,
+            timestamp: tTime,
+            type: 'SIGNAL_RESTORED',
+            description: `🔵 ${s.id}: Post-passage clearance; restoring normal cycle`,
+            severity: 'INFO',
+            relatedSignal: s.id,
+          });
+        }
+      }
+    }
+
+    // Phase 5 Transition: Mission Arrived
+    if (amb.status === 'ARRIVED' && !tracker.arrived) {
+      tracker.arrived = true;
+      newEvents.push({
+        id: `evt-mission-arr-${tTime}`,
+        timestamp: tTime,
+        type: 'MISSION_COMPLETE',
+        description: `🏁 AMB-01 arrived at ${telemetry.mission.destination}. Time Saved: ${telemetry.mission.timeSaved}s`,
+        severity: 'SUCCESS',
+        relatedUnit: 'AMB-01',
+      });
+    }
+
+    if (newEvents.length > 0) {
+      setPipelineEvents((prev) => [...newEvents, ...prev]);
+    }
+  }, [telemetry, isRunning, recommendation, safetyValidation, corridorPlan, overrideSignal]);
+
+  const handleStart = async () => {
+    await sirenAudio.handleUserGesture();
+    sirenAudio.setMuted(false);
+    sirenAudio.startSiren();
+    sendControl('start');
+  };
+
+  const handlePause = () => {
+    sirenAudio.stopSiren();
+    sendControl('pause');
+  };
+
+  const handleReset = () => {
+    sirenAudio.stopSiren();
+    sendControl('reset');
+    setDismissedRecId(null);
+    transitionTrackerRef.current = {
+      emergencyDetected: false,
+      lastDecisionAction: '',
+      lastDecisionSignal: '',
+      lastSafetyDecision: '',
+      signalPhases: {},
+      arrived: false,
+    };
+    policeCoordinatorRef.current.resetHistory();
+    setPipelineEvents([]);
+    setDispatchedAlerts([]);
+  };
+
+  const handleSpeedChange = (speed: 1 | 2 | 5) => {
+    sendControl('speed', speed);
+  };
+
+  const handleExecuteRecommendation = async () => {
+    if (!safetyValidation) return;
+    if (safetyValidation.decision === 'APPROVED') {
+      await executeValidatedControl(safetyValidation, {
+        onLocalSignalChange: (sigId, phase, pat) => overrideSignal(sigId, phase, pat),
+      });
+      setPipelineEvents((prev) => [
+        {
+          id: `evt-manual-${Date.now()}`,
+          timestamp: telemetry?.simulation.elapsedTime ?? 0,
+          type: 'OPERATOR_OVERRIDE_EXECUTED',
+          description: `Operator Executed Override for ${recommendation.targetSignal || 'corridor'} (Safety Approved)`,
+          severity: 'SUCCESS',
+          relatedSignal: recommendation.targetSignal || undefined,
+        },
+        ...prev,
+      ]);
+    } else {
+      setPipelineEvents((prev) => [
+        {
+          id: `evt-manual-blocked-${Date.now()}`,
+          timestamp: telemetry?.simulation.elapsedTime ?? 0,
+          type: 'OPERATOR_OVERRIDE_BLOCKED',
+          description: `Cannot Execute: Safety Validator Rejected (${safetyValidation.safetySummary})`,
+          severity: 'CRITICAL',
+          relatedSignal: recommendation.targetSignal || undefined,
+        },
+        ...prev,
+      ]);
+    }
+  };
+
+  return (
+    <div className="w-full min-h-screen bg-gray-950 font-body text-gray-100 flex flex-col justify-between select-none">
+      {/* ── 1. COMMAND CENTER HEADER ── */}
+      <AppHeader
+        activeTab={activeTab}
+        simulationTime={simulationTime}
+        connectionStatus={connectionStatus}
+        onTabChange={setActiveTab}
+        isRunning={isRunning}
+        onStart={handleStart}
+        onPause={handlePause}
+        onReset={handleReset}
+        speed={simSpeed}
+        onSpeedChange={handleSpeedChange}
+      />
+
+      {/* ── 2. MAIN OPERATIONAL WORKSPACE (VIEW SWITCHER) ── */}
+      <main className="flex-1 px-3 sm:px-4 py-3.5 flex flex-col gap-3.5 w-full max-w-[1920px] mx-auto min-h-0">
+        {activeTab === 'signals' ? (
+          <SignalControlView
+            telemetry={telemetry}
+            connectionStatus={connectionStatus}
+            safetyValidation={safetyValidation}
+            corridorPlan={corridorPlan}
+            events={pipelineEvents}
+            onOverrideSignal={overrideSignal}
+            onResetCorridor={handleReset}
+          />
+        ) : activeTab === 'analytics' ? (
+          <AnalyticsView
+            telemetry={telemetry}
+            connectionStatus={connectionStatus}
+            events={pipelineEvents}
+            onNavigateToLive={() => setActiveTab('live')}
+          />
+        ) : activeTab === 'alerts' ? (
+          <AlertsView
+            telemetry={telemetry}
+            policeAssignments={policeAssignments}
+            events={pipelineEvents}
+            dispatchedAlerts={dispatchedAlerts}
+            connectionStatus={connectionStatus}
+            onResetCorridor={handleReset}
+          />
+        ) : (
+          /* PRIMARY VIEW: TWO-COLUMN COMMAND CENTER LAYOUT */
+          <div className="flex-1 flex flex-col gap-3.5 min-h-0">
+            {/* Top Corridor Mission-Flow Strip */}
+            <CorridorFlowPipeline
+              telemetry={telemetry}
+              isRunning={isRunning}
+            />
+
+            <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-3.5 items-start min-h-0">
+              {/* ── LEFT / PRIMARY: DIGITAL TWIN & MISSION TIMELINE ── */}
+              <div className="lg:col-span-7 xl:col-span-7 flex flex-col gap-3.5 min-h-0">
+                {/* Tactical Digital Twin Viewport */}
+                <div className="flex flex-col min-h-[480px]">
+                  <SimulationViewport
+                    telemetry={telemetry}
+                    connectionStatus={connectionStatus}
+                  />
+                </div>
+
+                {/* Mission Event Timeline */}
+                <div className="flex flex-col">
+                  <EventTimeline
+                    events={pipelineEvents}
+                    telemetry={telemetry}
+                    isRunning={isRunning}
+                  />
+                </div>
+              </div>
+
+              {/* ── RIGHT / SUPPORTING: OPERATIONAL DESK ── */}
+              <div className="lg:col-span-5 xl:col-span-5 flex flex-col gap-3.5 min-h-0">
+                {/* 1. Ambulance Status (AMB-01 Main Operational Entity) */}
+                <AmbulanceStatus
+                  telemetry={telemetry?.ambulance}
+                  signals={telemetry?.signals}
+                  id={telemetry?.ambulance.id ?? 'AMB-01'}
+                  status={telemetry?.ambulance.status ?? (isConnected ? 'STAGED' : 'DISCONNECTED')}
+                  eta={telemetry ? `${telemetry.ambulance.etaSeconds}s` : '02:41'}
+                  speed={telemetry?.ambulance.speedKmh ?? 42}
+                  distanceToTarget={telemetry?.ambulance.distanceToNextSignal ?? 1800}
+                />
+
+                {/* 2. Signal Interlock Status */}
+                <SignalStatus
+                  signals={telemetry?.signals}
+                />
+
+                {/* 3. Safety Gate (Prominent ResQX Differentiator) */}
+                <SafetyGateCard
+                  safetyValidation={safetyValidation}
+                />
+
+                {/* 4. Police Coordination */}
+                <PoliceCoordinationCard
+                  assignments={policeAssignments}
+                  dispatchedAlerts={dispatchedAlerts}
+                  telemetry={telemetry}
+                />
+
+                {/* 5. AI Decision Engine & Operator Override */}
+                <AIRecommendationCard
+                  recommendation={recommendation}
+                  onExecute={handleExecuteRecommendation}
+                  onDismiss={() => {
+                    const typePrefix =
+                      recommendation.id.split('-')[0] + '-' + recommendation.id.split('-')[1];
+                    setDismissedRecId(typePrefix);
+                  }}
+                />
+
+                {/* 6. Live Sensor Telemetry */}
+                <LiveTelemetryCard
+                  telemetry={telemetry}
+                  connectionStatus={connectionStatus}
+                />
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* ── 3. BOTTOM SIMULATION CONTROLS BAR ── */}
+      <SimulationControls
+        isRunning={isRunning}
+        speed={simSpeed}
+        isConnected={isConnected}
+        onStart={handleStart}
+        onPause={handlePause}
+        onReset={handleReset}
+        onSpeedChange={handleSpeedChange}
+      />
+    </div>
+  );
+}
+
+export default App;
